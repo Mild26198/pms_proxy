@@ -1,0 +1,17 @@
+{
+  "name": "micros-pos-listener",
+  "version": "1.0.0",
+  "description": "Micros POS FIAS Protocol Listener - Captures GI/GO/GC guest events",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "node test-client.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "axios": "^1.7.0"
+  },
+  "keywords": ["micros", "fias", "pms", "hotel", "smartconnector", "ecostruxure"],
+  "license": "MIT"
+}

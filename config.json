@@ -1,0 +1,27 @@
+{
+  "proxyPort": 5016,
+  "proxyHost": "0.0.0.0",
+
+  "micros": {
+    "host": "10.242.28.4",
+    "port": 5016
+  },
+
+  "dbPath": "./micros_guests.db",
+
+  "webhook": {
+    "url": null,
+    "headers": { "Content-Type": "application/json" },
+    "timeout": 5000,
+    "retries": 3
+  },
+
+  "reconnect": {
+    "enabled": true,
+    "delay": 5000,
+    "maxAttempts": 0
+  },
+
+  "logLevel": "info",
+  "logFile": "./micros-proxy.log"
+}
