@@ -225,16 +225,18 @@ function escapeXml(s) {
     .replace(/'/g, '&apos;');
 }
 
-/**
- * <Room117>… — RoomDD = วันออก GD + เวลา TI (9/4/2026 12:00:00)
- * RoomOCC = ตัวเลข (GI=1, GO=0, GC=2)
- * RoomGN = ฟิลด์ GN (guest name); ถ้าไม่มีใช้ GF + GL
- * RoomGL = ฟิลด์ GL
- */
-function buildGuestEventXml(parsed) {
+function getSafeRoomKey(parsed) {
   const f = parsed.fields;
   const rawRoom = (f.room_number || 'UNKNOWN').trim();
-  const safeRoom = rawRoom.replace(/[^0-9A-Za-z_-]/g, '') || 'UNKNOWN';
+  return rawRoom.replace(/[^0-9A-Za-z_-]/g, '') || 'UNKNOWN';
+}
+
+/**
+ * บล็อก <Room117>…</Room117> ห้องเดียว — RoomDD / RoomOCC / RoomGN / RoomGL
+ */
+function buildSingleRoomXml(parsed) {
+  const f = parsed.fields;
+  const safeRoom = getSafeRoomKey(parsed);
   const rootTag = `Room${safeRoom}`;
   const roomDD = f.departure ? fmtDepartureDateTimeDMY(f.departure, f.time) : '';
   let roomOCC = 0;
@@ -250,7 +252,6 @@ function buildGuestEventXml(parsed) {
   const roomGL = f.last_name != null ? String(f.last_name) : '';
 
   return (
-    `<?xml version="1.0" encoding="UTF-8"?>\n` +
     `<${rootTag}>\n` +
     `  <RoomDD>${escapeXml(roomDD)}</RoomDD>\n` +
     `  <RoomOCC>${roomOCC}</RoomOCC>\n` +
@@ -260,11 +261,45 @@ function buildGuestEventXml(parsed) {
   );
 }
 
-let lastGuestEventXml = '';
+/** Webhook / ข้อความเดียว — ห้องเดียว + XML declaration */
+function buildGuestEventXml(parsed) {
+  return `<?xml version="1.0" encoding="UTF-8"?>\n${buildSingleRoomXml(parsed)}`;
+}
+
+/** ห้องล่าสุดต่อ key (หมายเลขห้อง) สำหรับ endpoint รวมหลายห้อง */
+const roomXmlByKey = new Map();
+
+function indentXmlBlock(block, spaces = '  ') {
+  return block
+    .split('\n')
+    .map((line) => spaces + line)
+    .join('\n');
+}
+
+function buildAllRoomsDocumentXml() {
+  if (roomXmlByKey.size === 0) {
+    return '<?xml version="1.0" encoding="UTF-8"?><Rooms/>';
+  }
+  const keys = [...roomXmlByKey.keys()].sort((a, b) => {
+    const na = parseInt(a, 10);
+    const nb = parseInt(b, 10);
+    if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+    return String(a).localeCompare(String(b));
+  });
+  const inner = keys.map((k) => indentXmlBlock(roomXmlByKey.get(k))).join('\n');
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<Rooms>\n${inner}\n</Rooms>`
+  );
+}
+
+let lastGuestEventXml = '<?xml version="1.0" encoding="UTF-8"?><Rooms/>';
 
 function publishGuestXml(parsed) {
   if (!config.xmlServer.enabled) return;
-  lastGuestEventXml = buildGuestEventXml(parsed);
+  const key = getSafeRoomKey(parsed);
+  roomXmlByKey.set(key, buildSingleRoomXml(parsed));
+  lastGuestEventXml = buildAllRoomsDocumentXml();
 }
 
 // ─── Frame Buffer ────────────────────────────────────────────────
