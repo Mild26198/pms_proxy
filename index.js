@@ -131,6 +131,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_events_room ON guest_events(room_number);
   CREATE INDEX IF NOT EXISTS idx_events_guest ON guest_events(guest_id);
   CREATE INDEX IF NOT EXISTS idx_events_created ON guest_events(created_at);
+
+  CREATE TABLE IF NOT EXISTS room_snapshot (
+    room_key   TEXT PRIMARY KEY,
+    xml_block  TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now','localtime'))
+  );
 `);
 
 const insertEvent = db.prepare(`
@@ -144,13 +150,24 @@ const insertEvent = db.prepare(`
 
 const updateWebhookStatus = db.prepare(`UPDATE guest_events SET webhook_sent = ? WHERE id = ?`);
 
+const upsertRoomSnapshot = db.prepare(`
+  INSERT INTO room_snapshot (room_key, xml_block, updated_at)
+  VALUES (@room_key, @xml_block, datetime('now','localtime'))
+  ON CONFLICT(room_key) DO UPDATE SET
+    xml_block = excluded.xml_block,
+    updated_at = excluded.updated_at
+`);
+
 // ─── FIAS Protocol Parser ────────────────────────────────────────
 const STX = 0x02;
 const ETX = 0x03;
 
 const FIELD_MAP = {
   'DA': 'date', 'TI': 'time', 'G#': 'guest_id', 'RN': 'room_number',
-  'GF': 'first_name', 'GL': 'last_name', 'GN': 'guest_name', 'GT': 'title',
+  'GF': 'first_name',
+  'GL': 'gl_code',
+  'GN': 'last_name',
+  'GT': 'title',
   'GA': 'arrival', 'GD': 'departure', 'GS': 'share', 'GV': 'vip',
   'GG': 'group', 'V#': 'version', 'IF': 'interface', 'RI': 'record_indicator',
   'FL': 'field_list', 'SF': 'suite_from'
@@ -243,12 +260,7 @@ function buildSingleRoomXml(parsed) {
   if (parsed.type === 'GI') roomOCC = 1;
   else if (parsed.type === 'GO') roomOCC = 0;
   else if (parsed.type === 'GC') roomOCC = 2;
-  let roomGN = '';
-  if (f.guest_name != null && String(f.guest_name).trim() !== '') {
-    roomGN = String(f.guest_name).trim();
-  } else {
-    roomGN = [f.first_name, f.last_name].filter(Boolean).join(' ').trim();
-  }
+  const roomGN = [f.first_name, f.last_name].filter(Boolean).join(' ').trim();
   const roomGL = f.last_name != null ? String(f.last_name) : '';
 
   return (
@@ -295,12 +307,37 @@ function buildAllRoomsDocumentXml() {
 
 let lastGuestEventXml = '<?xml version="1.0" encoding="UTF-8"?><Rooms/>';
 
-function publishGuestXml(parsed) {
-  if (!config.xmlServer.enabled) return;
+/** เก็บสถานะห้องลง DB + memory — GO ยังคงเป็นห้องว่าง (OCC=0) ไม่ลบแถว */
+function syncRoomSnapshotFromParsed(parsed) {
   const key = getSafeRoomKey(parsed);
-  roomXmlByKey.set(key, buildSingleRoomXml(parsed));
-  lastGuestEventXml = buildAllRoomsDocumentXml();
+  const block = buildSingleRoomXml(parsed);
+  roomXmlByKey.set(key, block);
+  try {
+    upsertRoomSnapshot.run({ room_key: key, xml_block: block });
+  } catch (e) {
+    log('error', `room_snapshot: ${e.message}`);
+  }
+  if (config.xmlServer.enabled) {
+    lastGuestEventXml = buildAllRoomsDocumentXml();
+  }
 }
+
+function loadRoomSnapshotsFromDb() {
+  try {
+    const rows = db.prepare('SELECT room_key, xml_block FROM room_snapshot').all();
+    for (const row of rows) {
+      roomXmlByKey.set(row.room_key, row.xml_block);
+    }
+    if (config.xmlServer.enabled) {
+      lastGuestEventXml = buildAllRoomsDocumentXml();
+    }
+    log('info', `Room snapshot loaded from DB: ${rows.length} rooms`);
+  } catch (e) {
+    log('warn', `Room snapshot load: ${e.message}`);
+  }
+}
+
+loadRoomSnapshotsFromDb();
 
 // ─── Frame Buffer ────────────────────────────────────────────────
 class FrameBuffer {
@@ -336,7 +373,8 @@ function logGuestEvent(parsed, direction) {
   if (f.title)       log('info', `  Title:      ${f.title}`);
   if (f.first_name)  log('info', `  First Name: ${f.first_name}`);
   if (f.last_name)   log('info', `  Last Name:  ${f.last_name}`);
-  if (f.guest_name)  log('info', `  VIP Level:  ${f.guest_name}`);
+  if (f.gl_code)     log('info', `  GL code:    ${f.gl_code}`);
+  if (f.vip)         log('info', `  VIP Level:  ${f.vip}`);
   if (f.arrival)     log('info', `  Arrival:    ${fmtDate(f.arrival)}`);
   if (f.departure)   log('info', `  Departure:  ${fmtDate(f.departure)}`);
   if (f.share)       log('info', `  Share:      ${f.share === 'Y' ? 'Yes' : 'No'}`);
@@ -355,7 +393,8 @@ function saveToDatabase(parsed, rawMessage, direction) {
       room_number: f.room_number || null,
       first_name: f.first_name || null,
       last_name: f.last_name || null,
-      guest_name: f.guest_name || null,
+      guest_name:
+        [f.first_name, f.last_name].filter(Boolean).join(' ').trim() || null,
       title: f.title || null,
       arrival: f.arrival ? fmtDate(f.arrival) : null,
       departure: f.departure ? fmtDate(f.departure) : null,
@@ -413,7 +452,7 @@ async function processMessage(parsed, rawMessage, direction) {
   if (isGuestEvent) {
     logGuestEvent(parsed, direction);
     const dbId = saveToDatabase(parsed, rawMessage, direction);
-    publishGuestXml(parsed);
+    syncRoomSnapshotFromParsed(parsed);
     await sendWebhook(parsed, rawMessage, dbId);
   } else {
     const label = EVENT_NAMES[parsed.type] || parsed.type;
