@@ -23,6 +23,7 @@
  */
 
 const net = require('net');
+const http = require('http');
 const path = require('path');
 const Database = require('better-sqlite3');
 const axios = require('axios');
@@ -44,12 +45,21 @@ const defaultConfig = {
   // Database
   dbPath: path.join(__dirname, 'micros_guests.db'),
 
-  // Webhook
+  // Webhook — format: "json" | "xml" (xml = รูท <Room{N}> + RoomDD/RoomOCC/RoomGN/RoomGL)
   webhook: {
     url: null,
+    format: 'json',
     headers: { 'Content-Type': 'application/json' },
     timeout: 5000,
     retries: 3
+  },
+
+  // HTTP GET 1 endpoint — คืน XML ล่าสุดจาก guest event (GI/GO/GC)
+  xmlServer: {
+    enabled: false,
+    host: '0.0.0.0',
+    port: 8080,
+    path: '/xml'
   },
 
   // Auto-reconnect to Micros if connection drops
@@ -69,6 +79,7 @@ if (fs.existsSync(CONFIG_PATH)) {
     const userConfig = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
     config = { ...defaultConfig, ...userConfig };
     if (userConfig.webhook) config.webhook = { ...defaultConfig.webhook, ...userConfig.webhook };
+    if (userConfig.xmlServer) config.xmlServer = { ...defaultConfig.xmlServer, ...userConfig.xmlServer };
     if (userConfig.micros) config.micros = { ...defaultConfig.micros, ...userConfig.micros };
     if (userConfig.reconnect) config.reconnect = { ...defaultConfig.reconnect, ...userConfig.reconnect };
   } catch (e) {
@@ -186,6 +197,76 @@ function fmtTime(t) {
   return (t && t.length >= 6) ? `${t.substring(0,2)}:${t.substring(2,4)}:${t.substring(4,6)}` : t;
 }
 
+/** วันที่แบบ 9/4/2026 12:00:00 — วัน/เดือนไม่มี leading zero, เวลา HH:mm:ss จาก TI (ไม่มี TI ใช้ 00:00:00) */
+function fmtDepartureDateTimeDMY(d6, ti) {
+  if (!d6 || d6.length !== 6) return '';
+  const yy = parseInt(d6.substring(0, 2), 10);
+  const mm = parseInt(d6.substring(2, 4), 10);
+  const dd = parseInt(d6.substring(4, 6), 10);
+  const year = 2000 + yy;
+  let hh = '00';
+  let min = '00';
+  let ss = '00';
+  if (ti && ti.length >= 6) {
+    hh = ti.substring(0, 2);
+    min = ti.substring(2, 4);
+    ss = ti.substring(4, 6);
+  }
+  return `${dd}/${mm}/${year} ${hh}:${min}:${ss}`;
+}
+
+function escapeXml(s) {
+  if (s == null || s === '') return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * <Room117>… — RoomDD = วันออก GD + เวลา TI (9/4/2026 12:00:00)
+ * RoomOCC = ตัวเลข (GI=1, GO=0, GC=2)
+ * RoomGN = ฟิลด์ GN (guest name); ถ้าไม่มีใช้ GF + GL
+ * RoomGL = ฟิลด์ GL
+ */
+function buildGuestEventXml(parsed) {
+  const f = parsed.fields;
+  const rawRoom = (f.room_number || 'UNKNOWN').trim();
+  const safeRoom = rawRoom.replace(/[^0-9A-Za-z_-]/g, '') || 'UNKNOWN';
+  const rootTag = `Room${safeRoom}`;
+  const roomDD = f.departure ? fmtDepartureDateTimeDMY(f.departure, f.time) : '';
+  let roomOCC = 0;
+  if (parsed.type === 'GI') roomOCC = 1;
+  else if (parsed.type === 'GO') roomOCC = 0;
+  else if (parsed.type === 'GC') roomOCC = 2;
+  let roomGN = '';
+  if (f.guest_name != null && String(f.guest_name).trim() !== '') {
+    roomGN = String(f.guest_name).trim();
+  } else {
+    roomGN = [f.first_name, f.last_name].filter(Boolean).join(' ').trim();
+  }
+  const roomGL = f.last_name != null ? String(f.last_name) : '';
+
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<${rootTag}>\n` +
+    `  <RoomDD>${escapeXml(roomDD)}</RoomDD>\n` +
+    `  <RoomOCC>${roomOCC}</RoomOCC>\n` +
+    `  <RoomGN>${escapeXml(roomGN)}</RoomGN>\n` +
+    `  <RoomGL>${escapeXml(roomGL)}</RoomGL>\n` +
+    `</${rootTag}>`
+  );
+}
+
+let lastGuestEventXml = '';
+
+function publishGuestXml(parsed) {
+  if (!config.xmlServer.enabled) return;
+  lastGuestEventXml = buildGuestEventXml(parsed);
+}
+
 // ─── Frame Buffer ────────────────────────────────────────────────
 class FrameBuffer {
   constructor() { this.buffer = Buffer.alloc(0); }
@@ -258,18 +339,26 @@ function saveToDatabase(parsed, rawMessage, direction) {
 
 async function sendWebhook(parsed, rawMessage, dbId) {
   if (!config.webhook.url) return;
-  const payload = {
-    event_type: parsed.type,
-    event_name: EVENT_NAMES[parsed.type] || parsed.type,
-    timestamp: new Date().toISOString(),
-    data: parsed.fields,
-    raw: rawMessage
-  };
+  const useXml = config.webhook.format === 'xml';
+  const payload = useXml
+    ? buildGuestEventXml(parsed)
+    : {
+        event_type: parsed.type,
+        event_name: EVENT_NAMES[parsed.type] || parsed.type,
+        timestamp: new Date().toISOString(),
+        data: parsed.fields,
+        raw: rawMessage
+      };
+
+  const headers = { ...config.webhook.headers };
+  if (useXml) {
+    headers['Content-Type'] = 'application/xml; charset=utf-8';
+  }
 
   for (let attempt = 1; attempt <= config.webhook.retries; attempt++) {
     try {
       const res = await axios.post(config.webhook.url, payload, {
-        headers: config.webhook.headers,
+        headers,
         timeout: config.webhook.timeout
       });
       log('info', `  -> Webhook OK (${res.status})`);
@@ -289,6 +378,7 @@ async function processMessage(parsed, rawMessage, direction) {
   if (isGuestEvent) {
     logGuestEvent(parsed, direction);
     const dbId = saveToDatabase(parsed, rawMessage, direction);
+    publishGuestXml(parsed);
     await sendWebhook(parsed, rawMessage, dbId);
   } else {
     const label = EVENT_NAMES[parsed.type] || parsed.type;
@@ -432,16 +522,60 @@ function printStats() {
 
 const statsTimer = setInterval(printStats, 5 * 60 * 1000);
 
+let xmlHttpServer = null;
+if (config.xmlServer.enabled) {
+  const xmlPath = config.xmlServer.path.startsWith('/')
+    ? config.xmlServer.path
+    : `/${config.xmlServer.path}`;
+  xmlHttpServer = http.createServer((req, res) => {
+    if (req.method !== 'GET') {
+      res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Method Not Allowed');
+      return;
+    }
+    const pathname = (req.url || '/').split('?')[0];
+    if (pathname !== xmlPath) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not Found');
+      return;
+    }
+    const body =
+      lastGuestEventXml ||
+      '<?xml version="1.0" encoding="UTF-8"?><empty/>';
+    res.writeHead(200, {
+      'Content-Type': 'application/xml; charset=utf-8',
+      'Cache-Control': 'no-store'
+    });
+    res.end(body);
+  });
+  xmlHttpServer.listen(config.xmlServer.port, config.xmlServer.host, () => {
+    log(
+      'info',
+      `XML HTTP: GET http://${config.xmlServer.host}:${config.xmlServer.port}${xmlPath}`
+    );
+  });
+  xmlHttpServer.on('error', (err) => {
+    log('error', `XML HTTP server error: ${err.message}`);
+  });
+}
+
 // ─── Graceful Shutdown ───────────────────────────────────────────
 function shutdown() {
   log('info', 'Shutting down proxy...');
   printStats();
   clearInterval(statsTimer);
-  proxyServer.close(() => {
-    db.close();
-    logStream.end();
-    process.exit(0);
-  });
+  const done = () => {
+    proxyServer.close(() => {
+      db.close();
+      logStream.end();
+      process.exit(0);
+    });
+  };
+  if (xmlHttpServer) {
+    xmlHttpServer.close(() => done());
+  } else {
+    done();
+  }
 }
 
 process.on('SIGINT', shutdown);
@@ -462,7 +596,16 @@ proxyServer.listen(config.proxyPort, config.proxyHost, () => {
   log('info', `  Micros Host:  ${config.micros.host}`);
   log('info', `  Micros Port:  ${config.micros.port}`);
   log('info', `  Database:     ${path.basename(config.dbPath)}`);
-  log('info', `  Webhook:      ${config.webhook.url || 'disabled'}`);
+  log('info', `  Webhook:      ${config.webhook.url || 'disabled'} (${config.webhook.format || 'json'})`);
+  {
+    const xp = config.xmlServer.path.startsWith('/')
+      ? config.xmlServer.path
+      : `/${config.xmlServer.path}`;
+    log(
+      'info',
+      `  XML endpoint: ${config.xmlServer.enabled ? `http://${config.xmlServer.host}:${config.xmlServer.port}${xp}` : 'disabled'}`
+    );
+  }
   log('info', `  Reconnect:    ${config.reconnect.enabled ? 'enabled' : 'disabled'}`);
   log('info', '');
   log('info', '  Capturing: GI (Check-in) GO (Check-out) GC (Change)');
